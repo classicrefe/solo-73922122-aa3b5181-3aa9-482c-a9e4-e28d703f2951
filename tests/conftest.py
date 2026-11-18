@@ -51,15 +51,19 @@ def _init_schema(pg_dsn: str) -> None:
     conn = psycopg.connect(pg_dsn, autocommit=True)
     try:
         conn.execute(INIT_SQL.read_text(encoding="utf-8"))
+        # 封存记录跨用例共享同一数据库：每个用例从空表开始，互不影响
+        conn.execute("TRUNCATE reading_archives")
     finally:
         conn.close()
 
 
 @pytest.fixture()
-def client(pg_dsn, monkeypatch):
+def client(pg_dsn, monkeypatch, tmp_path):
     """每个测试拿到干净的 JobManager 与 TestClient。"""
+    archive_dir = tmp_path / "archives"
     monkeypatch.setenv("PG_DSN", pg_dsn)
     monkeypatch.setenv("WORK_DIR", "/tmp/recon-test-work")
+    monkeypatch.setenv("ARCHIVE_DIR", str(archive_dir))
 
     from app import config as config_mod
     from app import manager as manager_mod
@@ -68,6 +72,7 @@ def client(pg_dsn, monkeypatch):
     # settings 在导入时定型，这里直接改运行期单例字段
     monkeypatch.setattr(config_mod.settings, "pg_dsn", pg_dsn)
     monkeypatch.setattr(config_mod.settings, "work_dir", "/tmp/recon-test-work")
+    monkeypatch.setattr(config_mod.settings, "archive_dir", str(archive_dir))
 
     # 替换为全新管理器，保证测试间互不占用名额
     fresh = manager_mod.JobManager()
@@ -78,3 +83,24 @@ def client(pg_dsn, monkeypatch):
 
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture()
+def archive_env(pg_dsn, monkeypatch, tmp_path):
+    """独立的封存目录与全新元数据缓存，确保每个用例互不干扰。"""
+    archive_dir = tmp_path / "archives"
+    monkeypatch.setattr(config_settings(), "pg_dsn", pg_dsn)
+    monkeypatch.setattr(config_settings(), "archive_dir", str(archive_dir))
+
+    from app import archives as archives_mod
+
+    fresh = archives_mod.ArchiveManager()
+    monkeypatch.setattr(archives_mod, "archives", fresh)
+    monkeypatch.setattr("app.main.archive_mod.archives", fresh, raising=False)
+    return fresh, archive_dir
+
+
+def config_settings():
+    from app import config as config_mod
+
+    return config_mod.settings

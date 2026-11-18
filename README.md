@@ -5,6 +5,10 @@
 **行内容 + 出现次数**做多重集核对（忽略行序，`NULL` 与空串视为不同），
 返回一致结论或最多 20 种差异行及两侧次数。
 
+源表被更正后需要复算旧日结时，先通过封存接口把指定 UTC 日期的原始读数
+固化成 UTF-8 CSV（`meter_id, read_time, wh`），拿到封存编号、行数与
+SHA-256 后再下载原文件留档。
+
 ## 1. 快速启动
 
 ```bash
@@ -31,6 +35,10 @@ docker compose down -v
 | `GET`  | `/jobs` | 列出近期任务（含终态），状态查询始终可用 |
 | `GET`  | `/jobs/{job_id}` | 查询单个任务状态与结论 |
 | `POST` | `/jobs/{job_id}/cancel` | 请求取消，及时受理 |
+| `POST` | `/archives` | 按 UTC 日期封存原始读数，返回封存编号、行数、文件 SHA-256 |
+| `GET`  | `/archives` | 列出封存版本，可用 `?date=YYYY-MM-DD` 过滤 |
+| `GET`  | `/archives/{archive_id}` | 查询单次封存的元数据 |
+| `GET`  | `/archives/{archive_id}/download` | 按编号下载原 CSV（带 SHA-256 响应头） |
 
 任务状态：`pending → running →（cancelling）→ succeeded | failed | cancelled | timeout`。
 失败、取消、超时一律 **不发布比较结论**（`result` 为 `null`），仅给出原因。
@@ -65,6 +73,41 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
   }
 }
 ```
+
+### 封存示例
+
+```bash
+# 1) 封存 2026-11-15（UTC 区间 [00:00, 次日 00:00)）
+curl -X POST http://localhost:8000/archives \
+  -H 'Content-Type: application/json' -d '{"date":"2026-11-15"}'
+# {"archive_id":"...","archive_date":"2026-11-15","row_count":12,
+#  "file_sha256":"...","file_size":471,"created_at":"...",
+#  "download_url":"/archives/<archive_id>/download"}
+
+# 2) 按编号下载原文件并核对 SHA-256
+curl -OJ http://localhost:8000/archives/<archive_id>/download
+sha256sum 2026-11-15-<archive_id>.csv
+```
+
+CSV 格式（UTF-8、LF 换行、首行表头）：
+
+```csv
+meter_id,read_time,wh
+1001,2026-11-15T08:00:00.000000Z,1000
+1001,2026-11-15T09:00:00.000000Z,1150
+```
+
+- `read_time` 统一输出为 UTC ISO-8601（微秒精度、`Z` 结尾），不受数据库会话时区影响；
+- 行序固定为 `ORDER BY meter_id, read_time`；
+- 同一日期可重复封存：每次都是独立快照、独立版本，源表后续更正不会改变已封存文件。
+
+封存的失败语义：
+
+- 先写同目录临时文件并 `fsync`，再原子 `rename` 为正式文件，**最后**才登记
+  `reading_archives`；写文件或登记失败都会清理本次产物，绝不留下可下载的
+  半份文件或指向缺失文件的成功记录，可直接重试；
+- 服务重启时清理未登记的临时文件与孤儿文件，已登记文件不动；
+- 记录存在但文件缺失/大小不符时下载返回 `410`，而不是输出半份内容。
 
 ## 3. 对提交 SQL 的约束
 
@@ -102,6 +145,18 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
 - 严格按顺序收尾：**中止 SQL → 关闭连接 → 清空暂存目录 → 释放名额 → 才落终态**，
   因此状态查询一旦看到终态，名额必然已经释放、暂存必然已经清空。
 
+### 封存的一致性与发布原子性
+
+1. 封存使用自己的单读取连接快照会话（`REPEATABLE READ` + `pg_export_snapshot`），
+   在打开快照那一刻确定读取视图；此后其他会话的更正即使提交也不可见；
+2. 命名游标分批拉取并按 `ORDER BY meter_id, read_time` 输出，CSV 通过
+   `csv.writer` 流式写入，内存只保留一批行与一个输出缓冲；
+3. SHA-256 与行数在写盘过程中同步累计，与文件内容严格对应；
+4. 发布顺序：临时文件 → `fsync` → 原子 `rename` → `fsync` 目录 → `INSERT` 元数据。
+   任何一步失败都回滚本次产物；重启时再清理临时文件与无记录的孤儿文件；
+5. 下载只按元数据解析文件名，并校验文件大小；失败返回 404/410，绝不流式输出
+   半份文件。
+
 ## 5. 配置（环境变量）
 
 | 变量 | 默认值 | 说明 |
@@ -112,12 +167,18 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
 | `SORT_CHUNK_ROWS` | `20000` | 单个排序块行数 |
 | `MAX_DIFF_TYPES` | `20` | 差异展示上限 |
 | `WORK_DIR` | `/tmp/recon-work` | 外部排序暂存目录（独立卷） |
+| `ARCHIVE_DIR` | `/tmp/recon-archives` | 封存 CSV 目录（独立持久卷，与数据库记录共同可用） |
+| `ARCHIVE_STATEMENT_TIMEOUT_MS` | `0` | 封存查询的服务端超时，`0` 表示不限制 |
 
 ## 6. 本地自测
 
 ```bash
 # 单元 + 集成测试（集成测试需要一个 PostgreSQL；可用 PG_DSN 指定）
 python -m pytest tests/ -q
+
+# 封存关键路径：内容核对、并发更正隔离、版本独立、写入/登记失败无残留、
+# 重启自愈清理、文件缺失时拒绝下载
+python -m pytest tests/test_archives.py -q
 
 # 50 万行级端到端压测（内存峰值、暂存占用、结论正确性、清理与名额释放）
 python scripts/load_test.py
@@ -134,6 +195,7 @@ app/
   config.py          运行期配置
   sqlvalidation.py   只读 SELECT 静态校验
   db.py              快照会话、只读连接、命名游标流式拉取、列类型闸门
+  archives.py        按日期流式封存 CSV、SHA-256、原子发布与登记、启动自愈
   external_merge.py  流式 run、k 路归并、多重集核对
   manager.py         单名额编排、看门狗、取消/超时/失败的统一收尾
   models.py          API 模型

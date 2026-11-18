@@ -39,6 +39,12 @@ class Settings:
     # 暂存目录（容器内），独立挂载 tmpfs / 卷
     work_dir: str = _env("WORK_DIR", "/tmp/recon-work")
 
+    # 封存文件目录：必须与数据库记录共同持久化（容器内独立卷）
+    archive_dir: str = _env("ARCHIVE_DIR", "/tmp/recon-archives")
+    # 封存单条 SELECT 的服务端超时；0 表示不限制（按日期封存可能超过 30s）。
+    # 留空或非法值同样视为 0（不限制），避免误配置把大日期封存全部打断。
+    archive_statement_timeout_ms: int = _env_int("ARCHIVE_STATEMENT_TIMEOUT_MS", 0)
+
     # 允许出现在结果集中的列类型（PostgreSQL 类型名 -> psycopg 加载后的 Python 类型）
     allowed_pg_types: tuple[str, ...] = ("bigint", "text")
 

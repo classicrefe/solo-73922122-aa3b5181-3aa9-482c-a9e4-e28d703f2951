@@ -12,7 +12,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && groupadd --system recon && useradd --system --gid recon --no-create-home recon \
-    && mkdir -p /tmp/recon-work && chown recon:recon /tmp/recon-work
+    && mkdir -p /tmp/recon-work /tmp/recon-archives \
+    && chown recon:recon /tmp/recon-work /tmp/recon-archives
 
 COPY app ./app
 

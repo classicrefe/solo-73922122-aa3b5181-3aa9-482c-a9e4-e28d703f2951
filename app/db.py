@@ -35,19 +35,38 @@ class ColumnMeta:
     pg_type: str  # "bigint" | "text"
 
 
-def _open_connection() -> psycopg.Connection:
+def open_connection(
+    *,
+    statement_timeout_ms: int | None = None,
+    idle_in_tx_timeout_ms: int | None = None,
+    application_name: str = "recon-api",
+) -> psycopg.Connection:
+    """打开一条应用连接。
+
+    statement_timeout_ms / idle_in_tx_timeout_ms 为 None 时用全局默认值；
+    传 0 表示关闭对应超时（封存大日期区间时使用，实际耗时受调用方控制）。
+    """
+    timeout_ms = (
+        settings.statement_timeout_ms
+        if statement_timeout_ms is None
+        else statement_timeout_ms
+    )
+    idle_ms = (
+        settings.idle_in_tx_timeout_ms
+        if idle_in_tx_timeout_ms is None
+        else idle_in_tx_timeout_ms
+    )
     conn = psycopg.connect(
         settings.pg_dsn,
         connect_timeout=settings.connect_timeout,
         autocommit=True,          # 事务边界自己用 BEGIN 显式控制
-        application_name="recon-api",
+        application_name=application_name,
     )
     # SET 不接受绑定参数，以下均为内部 int 配置，直接内联安全
-    conn.execute(f"SET SESSION statement_timeout = {int(settings.statement_timeout_ms)}")
+    conn.execute(f"SET SESSION statement_timeout = {int(timeout_ms)}")
     conn.execute(f"SET SESSION lock_timeout = {int(settings.lock_timeout_ms)}")
     conn.execute(
-        f"SET SESSION idle_in_transaction_session_timeout = "
-        f"{int(settings.idle_in_tx_timeout_ms)}"
+        f"SET SESSION idle_in_transaction_session_timeout = {int(idle_ms)}"
     )
     # 单连接流式拉取即可，禁用并行 gather 以稳定内存与暂存行为
     conn.execute("SET SESSION max_parallel_workers_per_gather = 0")
@@ -55,18 +74,28 @@ def _open_connection() -> psycopg.Connection:
 
 
 class SnapshotSession:
-    """管理同一快照下的两条只读读取连接。"""
+    """管理同一已提交快照下的只读读取连接。
 
-    def __init__(self) -> None:
+    reader_count=2 供核对使用（左右两侧并行）；reader_count=1 供封存使用。
+    """
+
+    def __init__(self, reader_count: int = 2, *, statement_timeout_ms: int | None = None) -> None:
         self._snapshot_conn: psycopg.Connection | None = None
         self.readers: list[psycopg.Connection] = []
         self.snapshot_id: str | None = None
+        self.reader_count = reader_count
+        self.statement_timeout_ms = statement_timeout_ms
         self._closed = False
         self._lock = threading.Lock()
 
     def open(self) -> None:
+        # 封存单连接时关闭空闲事务超时：CSV 写盘可能耗时，连接不应被误杀
+        idle_ms = 0 if self.reader_count == 1 else None
         # 快照连接：开启可重复读只读事务并导出快照
-        snap_conn = _open_connection()
+        snap_conn = open_connection(
+            statement_timeout_ms=self.statement_timeout_ms,
+            idle_in_tx_timeout_ms=idle_ms,
+        )
         try:
             snap_conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             row = snap_conn.execute("SELECT pg_export_snapshot()").fetchone()
@@ -75,9 +104,15 @@ class SnapshotSession:
                 raise DbError("pg_export_snapshot() 未返回快照标识")
             self._snapshot_conn = snap_conn
 
-            # 两条独立读取连接，绑定同一快照
-            for _ in range(2):
-                conn = _open_connection()
+            # 独立读取连接，绑定同一快照
+            for _ in range(self.reader_count):
+                conn = open_connection(
+                    statement_timeout_ms=self.statement_timeout_ms,
+                    idle_in_tx_timeout_ms=idle_ms,
+                    application_name="recon-api-archive"
+                    if self.reader_count == 1
+                    else "recon-api",
+                )
                 conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 # 快照标识来自 pg_export_snapshot，用 Literal 安全内联
                 conn.execute(
@@ -117,7 +152,7 @@ class SnapshotSession:
         if not pids:
             return
         try:
-            admin = _open_connection()
+            admin = open_connection()
             try:
                 admin.execute(
                     "SELECT pg_terminate_backend(pid) FROM unnest(%s::int[]) AS pid",

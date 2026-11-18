@@ -34,11 +34,16 @@ services:
       MAX_DIFF_TYPES: "20"
       WORK_DIR: /tmp/recon-work
       PG_STATEMENT_TIMEOUT_MS: "28000"
+      ARCHIVE_DIR: /tmp/recon-archives
+      # 按日期封存可能超过单轮 30 秒；0 表示不限制封存语句时长
+      ARCHIVE_STATEMENT_TIMEOUT_MS: "0"
     ports:
       - "8000:8000"
     volumes:
       # 外部排序暂存：独立卷，任务结束即清空，不占容器可写层
       - reconwork:/tmp/recon-work
+      # 封存 CSV：必须持久化，并与 PostgreSQL 中的封存记录共同可用
+      - reconarchives:/tmp/recon-archives
     deploy:
       resources:
         limits:
@@ -49,3 +54,4 @@ services:
 volumes:
   pgdata:
   reconwork:
+  reconarchives:

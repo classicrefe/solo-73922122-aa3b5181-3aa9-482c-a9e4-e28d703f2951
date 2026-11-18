@@ -86,3 +86,25 @@ ON CONFLICT DO NOTHING;
 -- ) baseline
 -- GROUP BY line_name, hr
 -- ORDER BY line_name, hr;
+
+-- ============================================================
+-- 读数封存（archive）
+-- 快照读数以 CSV 文件落盘，元数据登记在此表；两者共同对外可用。
+-- 文件先写临时名并 fsync，再原子 rename 为正式名，最后才 INSERT 记录：
+-- 任何一步失败都不会留下可下载的半份文件或指向缺失文件的成功记录。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS reading_archives (
+    archive_id   text        PRIMARY KEY,   -- 封存编号（对外）
+    archive_date date        NOT NULL,      -- 被封存的 UTC 日期
+    row_count    bigint      NOT NULL CHECK (row_count >= 0),
+    file_sha256  text        NOT NULL CHECK (file_sha256 ~ '^[0-9a-f]{64}$'),
+    file_name    text        NOT NULL,      -- 归档目录内的文件名
+    file_size    bigint      NOT NULL CHECK (file_size >= 0),
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_reading_archives_date
+    ON reading_archives (archive_date, created_at DESC);
+
+-- 同一日期允许多次封存（源表更正后复算会形成独立版本），
+-- 因此不按 archive_date 建唯一约束。

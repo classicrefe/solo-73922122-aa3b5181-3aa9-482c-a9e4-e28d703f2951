@@ -1,6 +1,7 @@
 """API 请求 / 响应模型。"""
 from __future__ import annotations
 
+from datetime import date as DateType
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -60,3 +61,33 @@ class JobOut(BaseModel):
     @staticmethod
     def utcnow() -> datetime:
         return datetime.now(timezone.utc)
+
+
+class CreateArchiveRequest(BaseModel):
+    date: DateType = Field(
+        ...,
+        description="要封存的 UTC 日期，格式 YYYY-MM-DD（区间 [00:00, 次日 00:00) UTC）",
+        examples=["2026-11-15"],
+    )
+
+
+class ArchiveOut(BaseModel):
+    archive_id: str = Field(..., description="封存编号，用于下载")
+    archive_date: DateType = Field(..., description="被封存的 UTC 日期")
+    row_count: int = Field(..., description="CSV 数据行数（不含表头）")
+    file_sha256: str = Field(..., description="CSV 文件 SHA-256（小写十六进制）")
+    file_size: int = Field(..., description="CSV 文件字节数")
+    created_at: datetime
+    download_url: str = Field(..., description="按编号下载原文件的路径")
+
+    @classmethod
+    def from_record(cls, record) -> "ArchiveOut":
+        return cls(
+            archive_id=record.archive_id,
+            archive_date=record.archive_date,
+            row_count=record.row_count,
+            file_sha256=record.file_sha256,
+            file_size=record.file_size,
+            created_at=record.created_at,
+            download_url=f"/archives/{record.archive_id}/download",
+        )
